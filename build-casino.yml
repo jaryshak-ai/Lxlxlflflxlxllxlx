@@ -1,0 +1,2787 @@
+name: Build Casino
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-casino.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Create sources
+        run: |
+          set -e
+          mkdir -p "$(dirname 'Casino/pom.xml')"
+          cat > 'Casino/pom.xml' << 'CASINO_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+
+              <groupId>ru.eclips</groupId>
+              <artifactId>Casino</artifactId>
+              <version>1.0.1</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+
+              <build>
+                  <finalName>Casino-${project.version}</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Casino.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Casino.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.inventory.InventoryCloseEvent;
+          import cn.nukkit.event.inventory.InventoryTransactionEvent;
+          import cn.nukkit.event.player.PlayerDropItemEvent;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.event.player.PlayerJoinEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.element.ElementDropdown;
+          import cn.nukkit.form.element.ElementInput;
+          import cn.nukkit.form.element.ElementLabel;
+          import cn.nukkit.form.element.ElementSlider;
+          import cn.nukkit.form.response.FormResponse;
+          import cn.nukkit.form.response.FormResponseCustom;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindow;
+          import cn.nukkit.form.window.FormWindowCustom;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.inventory.transaction.InventoryTransaction;
+          import cn.nukkit.inventory.transaction.action.InventoryAction;
+          import cn.nukkit.inventory.transaction.action.SlotChangeAction;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.HashMap;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+
+          /**
+           * Casino: /casino (формы + виртуальный сундук) и /spin. Валюта: монеты TpCoins.
+           * Слоты, Мины, Рулетка, 3 сундука, Колесо фортуны. Исход всегда решает сервер (SecureRandom).
+           */
+          public class Casino extends PluginBase implements Listener {
+
+              private interface FormHandler {
+                  void on(FormResponse response);
+              }
+
+              private static final class FormCtx {
+                  final int id;
+                  final FormHandler handler;
+
+                  FormCtx(int id, FormHandler handler) {
+                      this.id = id;
+                      this.handler = handler;
+                  }
+              }
+
+              private static final class Delayed {
+                  final long at;
+                  final Runnable run;
+
+                  Delayed(long at, Runnable run) {
+                      this.at = at;
+                      this.run = run;
+                  }
+              }
+
+              private Coins coins;
+              private Store store;
+              private long tickNo;
+              private final List<Delayed> delayed = new ArrayList<>();
+              private final Map<String, Session> sessions = new HashMap<>();
+              private final Map<String, FormCtx> forms = new HashMap<>();
+              private final Map<String, Long> lastAction = new HashMap<>();
+
+              // ====================================================================
+              // Жизненный цикл
+              // ====================================================================
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  coins = new Coins(this);
+                  store = new Store(this, getConfig().getInt("log-keep-days", 30));
+                  getServer().getPluginManager().registerEvents(this, this);
+                  if (!startTicker()) {
+                      getLogger().error("Не удалось запустить таймер казино, плагин выключен.");
+                      getServer().getPluginManager().disablePlugin(this);
+                      return;
+                  }
+                  if (!coins.init()) {
+                      getLogger().warning("TpCoins пока не найден: игры будут недоступны, пока он не загрузится.");
+                  }
+                  // выплаты по играм, оборванным падением сервера
+                  later(60, this::payAllPending);
+                  getLogger().info("Casino включено.");
+              }
+
+              @Override
+              public void onDisable() {
+                  for (Session s : new ArrayList<>(sessions.values())) {
+                      try {
+                          endSession(s);
+                      } catch (Throwable ignored) {
+                          // идём дальше
+                      }
+                  }
+                  if (store != null) {
+                      store.shutdown();
+                  }
+              }
+
+              /** Таймер: каждый тик заново ставит себя через scheduleDelayedTask(Task, int), как в рабочем TopShop. */
+              private boolean startTicker() {
+                  try {
+                      scheduleNext();
+                      return true;
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              private void scheduleNext() {
+                  getServer().getScheduler().scheduleDelayedTask(new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          try {
+                              tick();
+                          } finally {
+                              if (isEnabled()) {
+                                  scheduleNext();
+                              }
+                          }
+                      }
+                  }, 1);
+              }
+
+              void later(int ticks, Runnable r) {
+                  delayed.add(new Delayed(tickNo + Math.max(1, ticks), r));
+              }
+
+              private void tick() {
+                  tickNo++;
+                  if (!delayed.isEmpty()) {
+                      List<Runnable> due = null;
+                      for (Iterator<Delayed> it = delayed.iterator(); it.hasNext(); ) {
+                          Delayed d = it.next();
+                          if (d.at <= tickNo) {
+                              if (due == null) {
+                                  due = new ArrayList<>();
+                              }
+                              due.add(d.run);
+                              it.remove();
+                          }
+                      }
+                      if (due != null) {
+                          for (Runnable r : due) {
+                              try {
+                                  r.run();
+                              } catch (Throwable t) {
+                                  getLogger().warning("Ошибка в отложенной задаче: " + t);
+                              }
+                          }
+                      }
+                  }
+                  if (!sessions.isEmpty()) {
+                      for (Session s : new ArrayList<>(sessions.values())) {
+                          try {
+                              if (s.ended) {
+                                  continue;
+                              }
+                              if (s.menu != null && s.menuOpened) {
+                                  if (s.game != null) {
+                                      s.game.tick();
+                                  }
+                              } else if (!s.menuOpened && tickNo - s.created > 100) {
+                                  endSession(s); // окно так и не открылось - возвращаем что причитается
+                              }
+                          } catch (Throwable t) {
+                              getLogger().warning("Ошибка игры " + s.type + ": " + t);
+                              endSession(s);
+                          }
+                      }
+                  }
+                  if (tickNo % 1200 == 0) {
+                      store.saveStats();
+                  }
+              }
+
+              // ====================================================================
+              // Вспомогательное
+              // ====================================================================
+
+              private void msg(Player p, String text) {
+                  if (p != null && p.isOnline()) {
+                      p.sendMessage(Fx.c(getConfig().getString("prefix", "&6[Казино]&r ")) + Fx.c(text));
+                  }
+              }
+
+              private long minBet() {
+                  return Math.max(1, getConfig().getInt("min-bet", 500));
+              }
+
+              private long maxBet() {
+                  return Math.max(minBet(), getConfig().getInt("max-bet", 50000));
+              }
+
+              private long cooldownMs() {
+                  return Math.max(0, getConfig().getInt("cooldown-seconds", 3)) * 1000L;
+              }
+
+              private boolean freeReady(String key) {
+                  long hours = Math.max(1, getConfig().getInt("free-spin-hours", 24));
+                  return System.currentTimeMillis() - store.lastFree(key) >= hours * 3600_000L;
+              }
+
+              private boolean worldDisabled(Player p) {
+                  try {
+                      String w = p.getLevel().getName();
+                      String f = p.getLevel().getFolderName();
+                      for (String d : getConfig().getStringList("disabled-worlds")) {
+                          if (d.equalsIgnoreCase(w) || d.equalsIgnoreCase(f)) {
+                              return true;
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                      // считаем, что можно
+                  }
+                  return false;
+              }
+
+              private Player online(String key) {
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      if (Coins.key(p.getName()).equals(key)) {
+                          return p;
+                      }
+                  }
+                  return null;
+              }
+
+              /** null - можно играть, иначе текст причины. */
+              private String precheck(Player p, String key, long bet) {
+                  if (!coins.init()) {
+                      return "&cКазино временно недоступно.";
+                  }
+                  if (worldDisabled(p)) {
+                      return "&cВ этом мире казино недоступно.";
+                  }
+                  Long last = lastAction.get(key);
+                  long left = last == null ? 0 : cooldownMs() - (System.currentTimeMillis() - last);
+                  if (left > 0) {
+                      return "&eПодожди " + ((left + 999) / 1000) + " сек.";
+                  }
+                  if (bet > 0 && coins.balance(key) < bet) {
+                      return "&cНедостаточно монет.";
+                  }
+                  return null;
+              }
+
+              private Game newGame(Session s) {
+                  switch (s.type) {
+                      case SLOTS:
+                          return new SlotsGame(this, s);
+                      case MINES:
+                          return new MinesGame(this, s);
+                      case ROULETTE:
+                          return new RouletteGame(this, s);
+                      case CHESTS:
+                          return new ChestsGame(this, s);
+                      default:
+                          return new WheelGame(this, s);
+                  }
+              }
+
+              // ====================================================================
+              // Раунды, выплаты, сессии
+              // ====================================================================
+
+              void setOwed(Session s, long amount) {
+                  s.owed = amount;
+                  store.setPending(s.key, amount);
+              }
+
+              private void startRound(Player p, GameType t, long bet, int a, int b, boolean free) {
+                  String key = Coins.key(p.getName());
+                  Session old = sessions.get(key);
+                  if (old != null) {
+                      endSession(old);
+                  }
+                  String why = precheck(p, key, free ? 0 : bet);
+                  if (why != null) {
+                      msg(p, why);
+                      return;
+                  }
+                  if (free) {
+                      if (!freeReady(key)) {
+                          msg(p, "&eБесплатный спин уже использован. Следующий через несколько часов.");
+                          return;
+                      }
+                      store.markFree(key, System.currentTimeMillis());
+                  } else if (!coins.take(key, bet, "казино: " + t.title)) {
+                      msg(p, "&cНедостаточно монет.");
+                      return;
+                  }
+                  Session s = new Session(p, key, t, free ? 0 : bet, free);
+                  if (t == GameType.MINES) {
+                      s.minesCount = a;
+                  } else if (t == GameType.ROULETTE) {
+                      s.rouletteKind = a;
+                      s.rouletteNumber = b;
+                  }
+                  s.created = tickNo;
+                  sessions.put(key, s);
+                  lastAction.put(key, System.currentTimeMillis());
+                  try {
+                      setOwed(s, s.bet); // на любой случай: если что-то пойдёт не так, ставка вернётся
+                      s.game = newGame(s);
+                      setOwed(s, s.game.prepare());
+                      s.menu = Menu.create(this, s, "&l" + t.title);
+                      s.menu.display();
+                  } catch (Throwable ex) {
+                      getLogger().warning("Не удалось начать игру " + t + ": " + ex);
+                      endSession(s);
+                  }
+              }
+
+              private void playAgain(Session s) {
+                  Player p = s.player;
+                  String why = precheck(p, s.key, s.bet);
+                  if (why != null) {
+                      msg(p, why);
+                      return;
+                  }
+                  if (!coins.take(s.key, s.bet, "казино: " + s.type.title)) {
+                      msg(p, "&cНедостаточно монет.");
+                      return;
+                  }
+                  s.resetRound();
+                  lastAction.put(s.key, System.currentTimeMillis());
+                  try {
+                      setOwed(s, s.bet);
+                      s.game = newGame(s);
+                      setOwed(s, s.game.prepare());
+                      s.game.begin();
+                  } catch (Throwable ex) {
+                      getLogger().warning("Ошибка новой игры " + s.type + ": " + ex);
+                      endSession(s);
+                  }
+              }
+
+              /** Выплатить причитающееся, записать лог и статистику. Вызывается один раз за раунд. */
+              void settle(Session s, long win, String detail) {
+                  if (s.settled) {
+                      return;
+                  }
+                  s.settled = true;
+                  long credited = 0;
+                  if (win > 0) {
+                      credited = coins.give(s.key, win, "казино: " + s.type.title);
+                  }
+                  if (credited >= 0) {
+                      store.clearPending(s.key);
+                  } else {
+                      store.setPending(s.key, win); // выплатим позже (вход игрока или перезапуск)
+                  }
+                  s.owed = 0;
+                  lastAction.put(s.key, System.currentTimeMillis());
+                  Player p = s.player;
+                  String nick = p.getName();
+                  if (!s.played) {
+                      if (win > 0) {
+                          msg(p, "&eСтавка возвращена: " + Fx.n(win) + " монет.");
+                      }
+                      return;
+                  }
+                  String gameKey = s.free ? "FREE" : s.type.title;
+                  store.record(gameKey, s.bet, Math.max(0, credited));
+                  store.addTop(nick, s.free ? "Бесплатный спин" : s.type.title, s.bet, win);
+                  store.log(nick, gameKey, s.bet, Math.max(0, credited), detail);
+                  if (credited < 0) {
+                      msg(p, "&eВыигрыш " + Fx.n(win) + " монет будет зачислен, как только экономика станет доступна.");
+                      return;
+                  }
+                  if (s.free) {
+                      msg(p, "&aБесплатный спин: +" + Fx.n(win) + " монет.");
+                  } else if (win > s.bet) {
+                      msg(p, "&aВыигрыш: +" + Fx.n(win) + " монет (x" + Fx.mult((double) win / s.bet) + ").");
+                  } else if (win == s.bet) {
+                      msg(p, "&eВозврат ставки: " + Fx.n(win) + " монет.");
+                  } else if (win > 0) {
+                      msg(p, "&6Частичный возврат: " + Fx.n(win) + " монет (x" + Fx.mult((double) win / s.bet) + ").");
+                  } else {
+                      msg(p, "&cПроигрыш: -" + Fx.n(s.bet) + " монет.");
+                  }
+                  if (credited < win) {
+                      msg(p, "&eБаланс достиг максимума: зачислено " + Fx.n(credited) + " из " + Fx.n(win) + ".");
+                  }
+                  int annMult = getConfig().getInt("announce-multiplier", 50);
+                  if (!s.free && annMult > 0 && s.bet > 0 && win >= s.bet * annMult) {
+                      getServer().broadcastMessage(Fx.c("&6[Казино] &e" + nick + " выиграл &a" + Fx.n(win)
+                              + " монет &e(x" + Fx.mult((double) win / s.bet) + ") в игре &f" + s.type.title + "&e!"));
+                  }
+              }
+
+              /** Закрыть сессию: выплатить что причитается, убрать окно. Безопасно вызывать много раз. */
+              void endSession(Session s) {
+                  if (s.ended) {
+                      return;
+                  }
+                  s.ended = true;
+                  try {
+                      settle(s, s.owed, "сессия завершена");
+                  } catch (Throwable t) {
+                      getLogger().warning("Ошибка выплаты: " + t);
+                  }
+                  Menu m = s.menu;
+                  s.menu = null;
+                  if (m != null) {
+                      try {
+                          s.player.removeWindow(m);
+                      } catch (Throwable ignored) {
+                          // игрок мог выйти
+                      }
+                      m.restore();
+                  }
+                  sessions.remove(s.key, s);
+              }
+
+              void menuOpened(Menu m) {
+                  Session s = m.sess;
+                  if (s.menu != m || s.ended) {
+                      return;
+                  }
+                  s.menuOpened = true;
+              }
+
+              /** Игрок сам закрыл окно (или сервер закрыл). */
+              void menuClosed(Menu m) {
+                  Session s = m.sess;
+                  if (s.menu != m) {
+                      return;
+                  }
+                  s.menu = null;
+                  s.ended = true;
+                  try {
+                      settle(s, s.owed, "окно закрыто");
+                  } catch (Throwable t) {
+                      getLogger().warning("Ошибка выплаты: " + t);
+                  }
+                  sessions.remove(s.key, s);
+              }
+
+              private void toMenu(Session s) {
+                  final Player p = s.player;
+                  endSession(s);
+                  later(1, () -> {
+                      if (p.isOnline()) {
+                          openMain(p);
+                      }
+                  });
+              }
+
+              private void payPendingFor(String key) {
+                  if (sessions.containsKey(key)) {
+                      return;
+                  }
+                  long amt = store.getPending(key);
+                  if (amt <= 0) {
+                      store.clearPending(key);
+                      return;
+                  }
+                  long credited = coins.give(key, amt, "казино: выплата после прерванной игры");
+                  if (credited >= 0) {
+                      store.clearPending(key);
+                      Player p = online(key);
+                      if (p != null && credited > 0) {
+                          msg(p, "&aВыплата за прерванную игру: +" + Fx.n(credited) + " монет.");
+                      }
+                  }
+              }
+
+              private void payAllPending() {
+                  for (String key : store.pendingCopy().keySet()) {
+                      try {
+                          payPendingFor(key);
+                      } catch (Throwable t) {
+                          getLogger().warning("Не удалось выплатить " + key + ": " + t);
+                      }
+                  }
+              }
+
+              // ====================================================================
+              // События
+              // ====================================================================
+
+              @EventHandler(priority = EventPriority.HIGH)
+              public void onTransaction(InventoryTransactionEvent e) {
+                  InventoryTransaction tr = e.getTransaction();
+                  Player p = tr.getSource();
+                  if (p == null) {
+                      return;
+                  }
+                  Session s = sessions.get(Coins.key(p.getName()));
+                  if (s == null || s.menu == null) {
+                      return;
+                  }
+                  boolean ours = false;
+                  int slot = -1;
+                  for (InventoryAction a : tr.getActions()) {
+                      if (a instanceof SlotChangeAction) {
+                          SlotChangeAction sa = (SlotChangeAction) a;
+                          if (sa.getInventory() == s.menu) {
+                              ours = true;
+                              if (slot < 0) {
+                                  slot = sa.getSlot();
+                              }
+                          }
+                      }
+                  }
+                  if (!ours) {
+                      return;
+                  }
+                  e.setCancelled(true); // ничего нельзя ни взять, ни положить, ни shift-кликнуть
+                  if (slot >= 0) {
+                      onClick(s, slot);
+                  }
+                  final Session fs = s;
+                  later(1, () -> resync(fs));
+              }
+
+              /** Вернуть клиенту настоящее содержимое окна и инвентаря после отменённого клика. */
+              private void resync(Session s) {
+                  try {
+                      if (s.menu != null && s.player.isOnline()) {
+                          s.menu.sendContents(s.player);
+                          s.player.getInventory().sendContents(s.player);
+                      }
+                  } catch (Throwable ignored) {
+                      // не критично
+                  }
+              }
+
+              @EventHandler
+              public void onInvClose(InventoryCloseEvent e) {
+                  Session s = sessions.get(Coins.key(e.getPlayer().getName()));
+                  if (s != null && s.menu != null && e.getInventory() == s.menu) {
+                      menuClosed(s.menu);
+                  }
+              }
+
+              private void onClick(Session s, int slot) {
+                  if (s.menu == null || !s.menuOpened || s.game == null || s.ended) {
+                      return;
+                  }
+                  long now = System.currentTimeMillis();
+                  if (now - s.lastClick < 150) {
+                      return;
+                  }
+                  s.lastClick = now;
+                  try {
+                      if (s.settled) {
+                          if (s.resultShown) {
+                              if (slot == s.game.menuSlot()) {
+                                  toMenu(s);
+                              } else if (slot == s.game.replaySlot() && !s.free) {
+                                  playAgain(s);
+                              }
+                          }
+                          return;
+                      }
+                      s.game.click(slot);
+                  } catch (Throwable t) {
+                      getLogger().warning("Ошибка клика " + s.type + ": " + t);
+                      endSession(s);
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGH)
+              public void onDrop(PlayerDropItemEvent e) {
+                  Session s = sessions.get(Coins.key(e.getPlayer().getName()));
+                  if (s != null && s.menu != null) {
+                      e.setCancelled(true);
+                  }
+              }
+
+              @EventHandler
+              public void onJoin(PlayerJoinEvent e) {
+                  final String key = Coins.key(e.getPlayer().getName());
+                  if (store.getPending(key) > 0) {
+                      later(60, () -> payPendingFor(key));
+                  }
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  String key = Coins.key(e.getPlayer().getName());
+                  forms.remove(key);
+                  Session s = sessions.get(key);
+                  if (s != null) {
+                      endSession(s);
+                  }
+              }
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  Player p = e.getPlayer();
+                  String key = Coins.key(p.getName());
+                  FormCtx c = forms.get(key);
+                  if (c == null || c.id != e.getFormID()) {
+                      return;
+                  }
+                  forms.remove(key);
+                  if (e.wasClosed() || e.getResponse() == null) {
+                      return;
+                  }
+                  try {
+                      c.handler.on(e.getResponse());
+                  } catch (Throwable t) {
+                      getLogger().warning("Ошибка формы: " + t);
+                  }
+              }
+
+              // ====================================================================
+              // Команды
+              // ====================================================================
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  String name = command.getName().toLowerCase(Locale.ROOT);
+                  if (name.equals("casino")) {
+                      if (args.length > 0 && sender.hasPermission("casino.admin")) {
+                          String sub = args[0].toLowerCase(Locale.ROOT);
+                          if (sub.equals("stats")) {
+                              showStats(sender);
+                              return true;
+                          }
+                          if (sub.equals("top")) {
+                              showTop(sender);
+                              return true;
+                          }
+                          if (sub.equals("reload")) {
+                              reloadConfig();
+                              sender.sendMessage(Fx.c("&aКонфиг казино перезагружен."));
+                              return true;
+                          }
+                      }
+                      if (!(sender instanceof Player)) {
+                          sender.sendMessage("Только для игроков. Админ-команды: /casino stats, /casino top, /casino reload");
+                          return true;
+                      }
+                      openMain((Player) sender);
+                      return true;
+                  }
+                  if (name.equals("spin")) {
+                      if (!(sender instanceof Player)) {
+                          sender.sendMessage("Только для игроков.");
+                          return true;
+                      }
+                      Player p = (Player) sender;
+                      String key = Coins.key(p.getName());
+                      if (args.length >= 1) {
+                          String in = args[0].replaceAll("[\\s_]", "");
+                          if (!in.matches("\\d{1,9}")) {
+                              msg(p, "&cИспользование: /spin [ставка " + minBet() + "-" + maxBet() + "]");
+                              return true;
+                          }
+                          long bet = Long.parseLong(in);
+                          if (bet < minBet() || bet > maxBet()) {
+                              msg(p, "&cСтавка должна быть от " + Fx.n(minBet()) + " до " + Fx.n(maxBet()) + ".");
+                              return true;
+                          }
+                          startRound(p, GameType.WHEEL, bet, 0, 0, false);
+                      } else if (freeReady(key)) {
+                          startRound(p, GameType.WHEEL, 0, 0, 0, true);
+                      } else {
+                          openBet(p, GameType.WHEEL, null);
+                      }
+                      return true;
+                  }
+                  return false;
+              }
+
+              private void showStats(CommandSender sender) {
+                  Map<String, Store.GameStat> st = store.statsCopy();
+                  sender.sendMessage(Fx.c("&6=== Казино: статистика ==="));
+                  long w = 0;
+                  long pd = 0;
+                  long g = 0;
+                  for (Map.Entry<String, Store.GameStat> e : st.entrySet()) {
+                      Store.GameStat x = e.getValue();
+                      String title = e.getKey().equals("FREE") ? "Бесплатные спины" : e.getKey();
+                      String rtp = x.wagered > 0 ? String.format(Locale.ROOT, "%.1f%%", 100.0 * x.paid / x.wagered) : "-";
+                      sender.sendMessage(Fx.c("&e" + title + "&f: игр " + x.games + ", ставки " + Fx.n(x.wagered)
+                              + ", выплаты " + Fx.n(x.paid) + ", прибыль казино " + Fx.n(x.wagered - x.paid) + ", возврат " + rtp));
+                      g += x.games;
+                      w += x.wagered;
+                      pd += x.paid;
+                  }
+                  sender.sendMessage(Fx.c("&6Итого&f: игр " + g + ", ставки " + Fx.n(w) + ", выплаты " + Fx.n(pd)
+                          + ", прибыль казино &a" + Fx.n(w - pd)));
+              }
+
+              private void showTop(CommandSender sender) {
+                  List<Store.Win> top = store.topCopy();
+                  if (top.isEmpty()) {
+                      sender.sendMessage(Fx.c("&7Выигрышей пока нет."));
+                      return;
+                  }
+                  sender.sendMessage(Fx.c("&6=== Топ выигрышей ==="));
+                  int i = 1;
+                  for (Store.Win w : top) {
+                      sender.sendMessage(Fx.c("&e" + i + ". &f" + w.player + " &7- &a" + Fx.n(w.win) + " &7(" + w.game
+                              + ", ставка " + Fx.n(w.bet) + ")"));
+                      i++;
+                  }
+              }
+
+              // ====================================================================
+              // Формы
+              // ====================================================================
+
+              /** Форма показывается через 0.5 сек (10 тиков) после действия: так клиент не теряет её. */
+              private void showForm(final Player p, final FormWindow w, final FormHandler h) {
+                  later(10, () -> {
+                      if (!p.isOnline()) {
+                          return;
+                      }
+                      try {
+                          int id = p.showFormWindow(w);
+                          forms.put(Coins.key(p.getName()), new FormCtx(id, h));
+                      } catch (Throwable t) {
+                          getLogger().warning("Не удалось показать форму: " + t);
+                      }
+                  });
+              }
+
+              private String balanceText(String key) {
+                  long b = coins.balance(key);
+                  return b < 0 ? "недоступен" : Fx.n(b);
+              }
+
+              private void openMain(final Player p) {
+                  final String key = Coins.key(p.getName());
+                  boolean free = freeReady(key);
+                  FormWindowSimple f = new FormWindowSimple(Fx.c("&lКазино"),
+                          Fx.c("&lВыбери игру\n\nТвой баланс: " + balanceText(key) + " монет\nСтавки: "
+                                  + Fx.n(minBet()) + " - " + Fx.n(maxBet()) + " монет"));
+                  final GameType[] ts = GameType.values();
+                  for (GameType t : ts) {
+                      f.addButton(new ElementButton(Fx.c("&0&l" + t.title)));
+                  }
+                  if (free) {
+                      f.addButton(new ElementButton(Fx.c("&0&lБесплатный спин (доступен!)")));
+                  }
+                  showForm(p, f, r -> {
+                      int id = ((FormResponseSimple) r).getClickedButtonId();
+                      if (id >= 0 && id < ts.length) {
+                          openRules(p, ts[id]);
+                      } else if (id == ts.length) {
+                          startRound(p, GameType.WHEEL, 0, 0, 0, true);
+                      }
+                  });
+              }
+
+              private String rules(GameType t) {
+                  switch (t) {
+                      case SLOTS:
+                          return "&lСлоты\n\n3 барабана, платит средняя линия.\n\n"
+                                  + "Три семёрки: x400\nТри алмаза: x80\nТри колокола: x25\nТри лимона: x10\nТри вишни: x3\n"
+                                  + "Две вишни: x0.5\nОдна вишня: x0.25\n\nВозврат игрокам около 93%.";
+                      case MINES:
+                          return "&lМины\n\nПоле из 21 клетки. Ты выбираешь, сколько мин спрятано (1-20).\n"
+                                  + "Каждая безопасная клетка повышает множитель. Чем больше мин, тем выше множители и риск.\n"
+                                  + "Нажми на золотой блок, чтобы забрать выигрыш. Если откроешь мину, ставка сгорает.\n"
+                                  + "Закроешь окно во время игры, и выигрыш заберётся сам.\n\nВозврат игрокам 95%.";
+                      case ROULETTE:
+                          return "&lРулетка\n\nЕвропейская, 37 ячеек, один зелёный ноль.\n\n"
+                                  + "Красное, чёрное, чёт, нечёт, 1-18, 19-36: x2\nДюжины и колонки: x3\nОдно число: x36\n"
+                                  + "Ноль забирает все ставки, кроме ставки на 0.\n\nВозврат игрокам 97.3%.";
+                      case CHESTS:
+                          return "&l3 сундука\n\nВ одном из трёх сундуков лежит приз, в двух пусто.\n"
+                                  + "Угадал: x" + Fx.mult(getConfig().getDouble("chests-multiplier", 2.85))
+                                  + " от ставки. Не угадал: ставка сгорает.\nЗакроешь окно до выбора, и ставка вернётся.\n\n"
+                                  + "Возврат игрокам 95%.";
+                      default:
+                          return "&lКолесо фортуны\n\n20 секторов:\nx0: 7 секторов\nx0.5: 5\nx1: 4\nx2: 2\nx3: 1\nx5: 1\n\n"
+                                  + "Возврат игрокам 92.5%.\n\nБесплатный спин раз в "
+                                  + Math.max(1, getConfig().getInt("free-spin-hours", 24)) + " ч: приз 1000-5000 монет.\n"
+                                  + "Быстро: команда /spin.";
+                  }
+              }
+
+              private void openRules(final Player p, final GameType t) {
+                  FormWindowSimple f = new FormWindowSimple(Fx.c("&l" + t.title), Fx.c(rules(t)));
+                  f.addButton(new ElementButton(Fx.c("&0&lСделать ставку")));
+                  f.addButton(new ElementButton(Fx.c("&0&lНазад")));
+                  showForm(p, f, r -> {
+                      int id = ((FormResponseSimple) r).getClickedButtonId();
+                      if (id == 0) {
+                          openBet(p, t, null);
+                      } else {
+                          openMain(p);
+                      }
+                  });
+              }
+
+              /** Форма ставки: поле ввода (элемент 1), ползунок (2), для Мин и Рулетки ещё параметры (3, 4). */
+              private void openBet(final Player p, final GameType t, String error) {
+                  final long min = minBet();
+                  final long max = maxBet();
+                  final String key = Coins.key(p.getName());
+                  int step = (int) Math.max(1, (max - min) / 99);
+                  FormWindowCustom f = new FormWindowCustom(Fx.c("&l" + t.title + ": ставка"));
+                  f.addElement(new ElementLabel(Fx.c(error == null
+                          ? "&lБаланс: " + balanceText(key) + " монет"
+                          : "&c&l" + error)));
+                  f.addElement(new ElementInput(Fx.c("&lСтавка вручную (" + Fx.n(min) + " - " + Fx.n(max) + ")"),
+                          "например " + min, ""));
+                  f.addElement(new ElementSlider(Fx.c("&lИли выбери ползунком"), (float) min, (float) max, step, (float) min));
+                  if (t == GameType.MINES) {
+                      f.addElement(new ElementSlider(Fx.c("&lКоличество мин"), 1f, (float) (MinesGame.CELLS - 1), 1, 3f));
+                  } else if (t == GameType.ROULETTE) {
+                      f.addElement(new ElementDropdown(Fx.c("&lНа что ставишь"), Arrays.asList(RouletteGame.KINDS), 0));
+                      f.addElement(new ElementInput(Fx.c("&lНомер (0-36, только для ставки на число)"), "например 17", ""));
+                  }
+                  showForm(p, f, r -> {
+                      FormResponseCustom resp = (FormResponseCustom) r;
+                      String in = resp.getInputResponse(1);
+                      in = in == null ? "" : in.replaceAll("[\\s_]", "");
+                      long bet;
+                      if (!in.isEmpty()) {
+                          if (!in.matches("\\d{1,9}")) {
+                              openBet(p, t, "Ставка должна быть целым числом.");
+                              return;
+                          }
+                          bet = Long.parseLong(in);
+                      } else {
+                          bet = Math.round(resp.getSliderResponse(2));
+                      }
+                      if (bet < min || bet > max) {
+                          openBet(p, t, "Ставка должна быть от " + Fx.n(min) + " до " + Fx.n(max) + ".");
+                          return;
+                      }
+                      if (coins.balance(key) < bet) {
+                          openBet(p, t, "Недостаточно монет. Баланс: " + balanceText(key) + ".");
+                          return;
+                      }
+                      int a = 0;
+                      int b = 0;
+                      if (t == GameType.MINES) {
+                          a = Math.max(1, Math.min(MinesGame.CELLS - 1, Math.round(resp.getSliderResponse(3))));
+                      } else if (t == GameType.ROULETTE) {
+                          a = resp.getDropdownResponse(3).getElementID();
+                          if (a == 12) {
+                              String num = resp.getInputResponse(4);
+                              num = num == null ? "" : num.trim();
+                              if (!num.matches("\\d{1,2}") || Integer.parseInt(num) > 36) {
+                                  openBet(p, t, "Для ставки на число укажи номер от 0 до 36.");
+                                  return;
+                              }
+                              b = Integer.parseInt(num);
+                          }
+                      }
+                      startRound(p, t, bet, a, b, false);
+                  });
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/ChestsGame.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/ChestsGame.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          /**
+           * 3 сундука: приз лежит в одном (выбирает сервер заранее). Выплата x2.85 (настраивается),
+           * шанс 1/3 -> возврат игроку 95%. Если закрыть окно до выбора, ставка возвращается.
+           */
+          final class ChestsGame extends Game {
+              private static final int[] SLOTS = {11, 13, 15};
+
+              private int prize;
+              private int pick = -1;
+              private int phase;
+              private int wait;
+              private long win;
+              private long mult1000;
+
+              ChestsGame(Casino plugin, Session s) {
+                  super(plugin, s);
+              }
+
+              @Override
+              long prepare() {
+                  prize = Rng.next(3);
+                  mult1000 = Math.round(plugin.getConfig().getDouble("chests-multiplier", 2.85) * 1000.0);
+                  return s.bet; // пока не выбрал - ставка возвращается
+              }
+
+              @Override
+              void begin() {
+                  paintBackground();
+                  Menu m = menu();
+                  m.setSlot(4, Fx.item(339, 0, "&e&lСтавка: " + Fx.n(s.bet),
+                          "&7Приз в одном из трёх сундуков", "&7Выигрыш: x" + Fx.mult(mult1000 / 1000.0)));
+                  for (int i = 0; i < 3; i++) {
+                      m.setSlot(SLOTS[i], Fx.item(54, 0, "&6&lСундук " + (i + 1), "&7Нажми, чтобы открыть"));
+                  }
+                  m.setSlot(22, Fx.item(339, 0, "&e&lВыбери сундук", "&7Если закроешь окно, ставка вернётся"));
+                  phase = 0;
+              }
+
+              @Override
+              void click(int slot) {
+                  if (phase != 0) {
+                      return;
+                  }
+                  for (int i = 0; i < 3; i++) {
+                      if (slot == SLOTS[i]) {
+                          pick = i;
+                          phase = 1;
+                          s.played = true;
+                          win = i == prize ? s.bet * mult1000 / 1000L : 0;
+                          plugin.setOwed(s, win);
+                          menu().setSlot(22, Fx.filler());
+                          reveal(i, i == prize);
+                          Fx.sound(s.player, "RANDOM_CLICK", 1f);
+                          wait = 15;
+                          return;
+                      }
+                  }
+              }
+
+              private void reveal(int i, boolean isPrize) {
+                  Menu m = menu();
+                  if (m == null) {
+                      return;
+                  }
+                  if (isPrize) {
+                      m.setSlot(SLOTS[i], Fx.item(41, 0, "&a&lПРИЗ!", "&7Выигрыш: x" + Fx.mult(mult1000 / 1000.0)));
+                  } else {
+                      m.setSlot(SLOTS[i], Fx.item(173, 0, "&c&lПусто"));
+                  }
+              }
+
+              @Override
+              void tick() {
+                  if (phase == 1) {
+                      if (--wait > 0) {
+                          return;
+                      }
+                      for (int i = 0; i < 3; i++) {
+                          if (i != pick) {
+                              reveal(i, i == prize);
+                          }
+                      }
+                      Fx.sound(s.player, "RANDOM_CLICK", 0.8f);
+                      phase = 2;
+                      wait = 12;
+                  } else if (phase == 2) {
+                      if (--wait > 0) {
+                          return;
+                      }
+                      phase = 3;
+                      finish(win, "3 сундука: выбран " + (pick + 1) + ", приз был в " + (prize + 1));
+                  }
+              }
+
+              @Override
+              int infoSlot() {
+                  return 4;
+              }
+
+              @Override
+              int replaySlot() {
+                  return 20;
+              }
+
+              @Override
+              int menuSlot() {
+                  return 24;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Coins.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Coins.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.plugin.Plugin;
+
+          import java.lang.reflect.Method;
+          import java.util.Locale;
+
+          /**
+           * Мост к экономике TpCoins через рефлексию (без compile-зависимости от чужого jar).
+           * Используются методы EconomyManager: getBalance, withdraw, deposit, getRoom.
+           */
+          final class Coins {
+              private final Casino plugin;
+              private Object eco;
+              private Method mBalance;
+              private Method mWithdraw;
+              private Method mDeposit;
+              private Method mRoom;
+
+              Coins(Casino plugin) {
+                  this.plugin = plugin;
+                  init();
+              }
+
+              /** Ключ аккаунта TpCoins: нижний регистр, пробелы -> подчёркивания. */
+              static String key(String name) {
+                  return name.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
+              }
+
+              synchronized boolean init() {
+                  if (eco != null) {
+                      return true;
+                  }
+                  try {
+                      Plugin tp = plugin.getServer().getPluginManager().getPlugin("TpCoins");
+                      if (tp == null) {
+                          return false;
+                      }
+                      Object e = tp.getClass().getMethod("getEconomy").invoke(tp);
+                      if (e == null) {
+                          return false;
+                      }
+                      Class<?> c = e.getClass();
+                      mBalance = c.getMethod("getBalance", String.class);
+                      mWithdraw = c.getMethod("withdraw", String.class, long.class, String.class);
+                      mDeposit = c.getMethod("deposit", String.class, long.class, String.class);
+                      mRoom = c.getMethod("getRoom", String.class);
+                      eco = e;
+                      return true;
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              /** Баланс или -1, если экономика недоступна. */
+              synchronized long balance(String key) {
+                  if (!init()) {
+                      return -1;
+                  }
+                  try {
+                      return ((Number) mBalance.invoke(eco, key)).longValue();
+                  } catch (Throwable t) {
+                      return -1;
+                  }
+              }
+
+              /** Списать ставку. true только если списано целиком. */
+              synchronized boolean take(String key, long amount, String reason) {
+                  if (amount <= 0) {
+                      return true;
+                  }
+                  if (!init()) {
+                      return false;
+                  }
+                  try {
+                      return "OK".equals(String.valueOf(mWithdraw.invoke(eco, key, amount, reason)));
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              /**
+               * Зачислить выигрыш. Возвращает сколько реально зачислено (может быть меньше при
+               * max-balance в TpCoins) или -1, если не удалось и нужно повторить позже.
+               */
+              synchronized long give(String key, long amount, String reason) {
+                  if (amount <= 0) {
+                      return 0;
+                  }
+                  if (!init()) {
+                      return -1;
+                  }
+                  try {
+                      String r = String.valueOf(mDeposit.invoke(eco, key, amount, reason));
+                      if ("OK".equals(r)) {
+                          return amount;
+                      }
+                      if ("OVER_LIMIT".equals(r)) {
+                          long room = ((Number) mRoom.invoke(eco, key)).longValue();
+                          if (room <= 0) {
+                              return 0;
+                          }
+                          String r2 = String.valueOf(mDeposit.invoke(eco, key, room, reason + " (лимит баланса)"));
+                          return "OK".equals(r2) ? room : -1;
+                      }
+                      return -1;
+                  } catch (Throwable t) {
+                      return -1;
+                  }
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Fx.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Fx.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.nbt.tag.CompoundTag;
+          import cn.nukkit.network.protocol.DataPacket;
+
+          import java.lang.reflect.Method;
+          import java.nio.ByteOrder;
+          import java.util.Locale;
+
+          /**
+           * Вспомогательные штуки: предметы, звуки, фейковый сундук у игрока.
+           * Всё, в чём я не уверен на 100% по API, сделано через рефлексию с запасными вариантами.
+           */
+          final class Fx {
+              private Fx() {
+              }
+
+              /** & -> цветовой символ. */
+              static String c(String s) {
+                  return s == null ? "" : s.replace('&', '§');
+              }
+
+              /** 12345678 -> "12 345 678". */
+              static String n(long v) {
+                  return String.format(Locale.ROOT, "%,d", v).replace(',', ' ');
+              }
+
+              static String mult(double v) {
+                  return String.format(Locale.ROOT, "%.2f", v);
+              }
+
+              private static final String[] COLORS = {"white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
+                      "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black"};
+
+              /** Имена предмета для Item.fromString (как делает рабочий TopShop), по старому id и мете. */
+              private static String[] names(int id, int meta) {
+                  String col = COLORS[Math.max(0, Math.min(15, meta))];
+                  switch (id) {
+                      case 160:
+                          return new String[]{col + "_stained_glass_pane", "stained_glass_pane:" + meta};
+                      case 35:
+                          return new String[]{col + "_wool", "wool:" + meta};
+                      case 260:
+                          return new String[]{"apple"};
+                      case 371:
+                          return new String[]{"gold_nugget"};
+                      case 266:
+                          return new String[]{"gold_ingot"};
+                      case 264:
+                          return new String[]{"diamond"};
+                      case 399:
+                          return new String[]{"nether_star"};
+                      case 262:
+                          return new String[]{"arrow"};
+                      case 339:
+                          return new String[]{"paper"};
+                      case 41:
+                          return new String[]{"gold_block"};
+                      case 173:
+                          return new String[]{"coal_block"};
+                      case 46:
+                          return new String[]{"tnt"};
+                      case 388:
+                          return new String[]{"emerald"};
+                      case 54:
+                          return new String[]{"chest"};
+                      default:
+                          return new String[0];
+                  }
+              }
+
+              private static Item byName(String... list) {
+                  for (String n : list) {
+                      try {
+                          Item it = Item.fromString(n);
+                          if (it != null && it.getId() != 0) {
+                              return it;
+                          }
+                      } catch (Throwable ignored) {
+                          // следующий вариант
+                      }
+                  }
+                  return null;
+              }
+
+              static Item item(int id, int meta, String name, String... lore) {
+                  Item it = byName(names(id, meta));
+                  if (it == null) {
+                      try {
+                          Item t = Item.get(id, meta, 1);
+                          if (t != null && t.getId() != 0) {
+                              it = t;
+                          }
+                      } catch (Throwable ignored) {
+                          // запасной вариант ниже
+                      }
+                  }
+                  if (it == null) {
+                      it = byName("gray_stained_glass_pane", "stained_glass_pane:7", "paper");
+                  }
+                  if (it == null) {
+                      it = Item.get(1);
+                  }
+                  try {
+                      if (name != null) {
+                          it.setCustomName(c(name));
+                      }
+                      if (lore != null && lore.length > 0) {
+                          String[] l = new String[lore.length];
+                          for (int i = 0; i < lore.length; i++) {
+                              l[i] = c(lore[i]);
+                          }
+                          it.setLore(l);
+                      }
+                  } catch (Throwable ignored) {
+                      // имя не критично
+                  }
+                  return it;
+              }
+
+              /** Цветное стекло-панель (id 160), цвет = meta 0..15. */
+              static Item pane(int color, String name, String... lore) {
+                  return item(160, color, name, lore);
+              }
+
+              /** Цветная шерсть (id 35), цвет = meta 0..15. */
+              static Item wool(int color, String name, String... lore) {
+                  return item(35, color, name, lore);
+              }
+
+              static Item filler() {
+                  return item(160, 7, " ");
+              }
+
+              // ---------- звук ----------
+
+              static void sound(Player p, String soundName, float pitch) {
+                  try {
+                      Class<?> sc = Class.forName("cn.nukkit.level.Sound");
+                      Object snd = null;
+                      for (Object o : sc.getEnumConstants()) {
+                          if (((Enum<?>) o).name().equals(soundName)) {
+                              snd = o;
+                              break;
+                          }
+                      }
+                      if (snd == null) {
+                          return;
+                      }
+                      Level lv = p.getLevel();
+                      Vector3 pos = new Vector3(p.x, p.y, p.z);
+                      for (Method m : lv.getClass().getMethods()) {
+                          if (!m.getName().equals("addSound")) {
+                              continue;
+                          }
+                          Class<?>[] pt = m.getParameterTypes();
+                          if (pt.length == 5 && pt[1] == sc && pt[4].isArray()) {
+                              m.invoke(lv, pos, snd, 1f, pitch, new Player[]{p});
+                              return;
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                      // звук не критичен
+                  }
+              }
+
+              // ---------- фейковый блок ----------
+
+              /** Отправить игроку блок (настоящий или фейковый) на позицию блока. Только ему. */
+              static void sendBlock(Player p, Vector3 block) {
+                  try {
+                      Level lv = p.getLevel();
+                      for (Method m : lv.getClass().getMethods()) {
+                          if (!m.getName().equals("sendBlocks")) {
+                              continue;
+                          }
+                          Class<?>[] pt = m.getParameterTypes();
+                          if (pt.length == 2 && pt[0] == Player[].class && pt[1] == Vector3[].class) {
+                              m.invoke(lv, new Player[]{p}, new Vector3[]{block});
+                              return;
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                      // нечего делать
+                  }
+              }
+
+              /** Имя сундука (заголовок окна). Если не получилось - окно просто будет называться "Сундук". */
+              static void sendChestName(Player p, int x, int y, int z, String title) {
+                  try {
+                      CompoundTag tag = new CompoundTag()
+                              .putString("id", "Chest")
+                              .putInt("x", x)
+                              .putInt("y", y)
+                              .putInt("z", z)
+                              .putString("CustomName", c(title));
+                      byte[] bytes = null;
+                      Class<?> nbtio = Class.forName("cn.nukkit.nbt.NBTIO");
+                      for (Method m : nbtio.getMethods()) {
+                          if (!m.getName().equals("write")) {
+                              continue;
+                          }
+                          Class<?>[] pt = m.getParameterTypes();
+                          if (pt.length == 3 && pt[0] == CompoundTag.class && pt[1] == ByteOrder.class && pt[2] == boolean.class) {
+                              bytes = (byte[]) m.invoke(null, tag, ByteOrder.LITTLE_ENDIAN, true);
+                              break;
+                          }
+                      }
+                      if (bytes == null) {
+                          for (Method m : nbtio.getMethods()) {
+                              if (!m.getName().equals("write")) {
+                                  continue;
+                              }
+                              Class<?>[] pt = m.getParameterTypes();
+                              if (pt.length == 2 && pt[0] == CompoundTag.class && pt[1] == ByteOrder.class) {
+                                  bytes = (byte[]) m.invoke(null, tag, ByteOrder.LITTLE_ENDIAN);
+                                  break;
+                              }
+                          }
+                      }
+                      if (bytes == null) {
+                          return;
+                      }
+                      Class<?> pc = Class.forName("cn.nukkit.network.protocol.BlockEntityDataPacket");
+                      Object pk = pc.getDeclaredConstructor().newInstance();
+                      pc.getField("x").setInt(pk, x);
+                      pc.getField("y").setInt(pk, y);
+                      pc.getField("z").setInt(pk, z);
+                      pc.getField("namedTag").set(pk, bytes);
+                      p.dataPacket((DataPacket) pk);
+                  } catch (Throwable ignored) {
+                      // заголовок не критичен
+                  }
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Game.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Game.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.item.Item;
+
+          /** Базовый класс игры. Исход решается в prepare() на сервере ДО анимации. */
+          abstract class Game {
+              final Casino plugin;
+              final Session s;
+
+              Game(Casino plugin, Session s) {
+                  this.plugin = plugin;
+                  this.s = s;
+              }
+
+              /** Решить исход. Вернуть, сколько монет причитается игроку, если всё оборвётся прямо сейчас. */
+              abstract long prepare();
+
+              /** Нарисовать интерфейс (сундук уже открыт). */
+              abstract void begin();
+
+              void click(int slot) {
+              }
+
+              /** Вызывается каждый тик, пока сундук открыт. */
+              void tick() {
+              }
+
+              /** Место для итоговой плашки. */
+              abstract int infoSlot();
+
+              abstract int replaySlot();
+
+              abstract int menuSlot();
+
+              /** Игра может поправить интерфейс перед итоговыми кнопками. */
+              void decorateResult() {
+              }
+
+              final Menu menu() {
+                  return s.menu;
+              }
+
+              final void paintBackground() {
+                  Menu m = s.menu;
+                  if (m != null) {
+                      m.paintAll();
+                  }
+              }
+
+              /** Завершить раунд: выплата, лог, итоговая плашка и кнопки. */
+              final void finish(long win, String detail) {
+                  plugin.settle(s, win, detail);
+                  decorateResult();
+                  showResult(win, detail);
+                  Fx.sound(s.player, win > s.bet ? "RANDOM_LEVELUP" : "NOTE_BASS", 1f);
+              }
+
+              private void showResult(long win, String detail) {
+                  Menu m = s.menu;
+                  if (m == null) {
+                      return;
+                  }
+                  Item info;
+                  if (s.free) {
+                      info = Fx.item(41, 0, "&a&lПриз: +" + Fx.n(win), "&7Бесплатный спин");
+                  } else if (!s.played) {
+                      info = Fx.item(266, 0, "&e&lСтавка возвращена: " + Fx.n(win));
+                  } else if (win > s.bet) {
+                      info = Fx.item(41, 0, "&a&lВыигрыш: +" + Fx.n(win), "&7Ставка: " + Fx.n(s.bet),
+                              "&7Множитель: x" + Fx.mult((double) win / s.bet));
+                  } else if (win == s.bet) {
+                      info = Fx.item(266, 0, "&e&lВозврат ставки: " + Fx.n(win), "&7Ставка: " + Fx.n(s.bet));
+                  } else if (win > 0) {
+                      info = Fx.item(371, 0, "&6&lЧастичный возврат: +" + Fx.n(win), "&7Ставка: " + Fx.n(s.bet),
+                              "&7Множитель: x" + Fx.mult((double) win / s.bet));
+                  } else {
+                      info = Fx.item(173, 0, "&c&lПроигрыш: -" + Fx.n(s.bet), "&7Ставка: " + Fx.n(s.bet));
+                  }
+                  m.setSlot(infoSlot(), info);
+                  if (!s.free) {
+                      m.setSlot(replaySlot(), Fx.wool(5, "&a&lИграть снова", "&7Ставка: " + Fx.n(s.bet) + " монет"));
+                  }
+                  m.setSlot(menuSlot(), Fx.wool(1, "&6&lВ меню", "&7Вернуться к выбору игры"));
+                  s.resultShown = true;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/GameType.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/GameType.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          enum GameType {
+              SLOTS("Слоты"),
+              MINES("Мины"),
+              ROULETTE("Рулетка"),
+              CHESTS("3 сундука"),
+              WHEEL("Колесо фортуны");
+
+              final String title;
+
+              GameType(String title) {
+                  this.title = title;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Menu.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Menu.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.inventory.ContainerInventory;
+          import cn.nukkit.inventory.Inventory;
+          import cn.nukkit.inventory.InventoryHolder;
+          import cn.nukkit.inventory.InventoryType;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.math.Vector3;
+
+          /**
+           * Виртуальный сундук на 27 слотов. Игроку на 3 блока выше головы (только у него на экране)
+           * рисуется сундук, и через него открывается окно. После закрытия там возвращается настоящий блок.
+           * Все клики отменяет Casino.onTransaction.
+           */
+          final class Menu extends ContainerInventory {
+
+              /** Владелец окна: точка + ссылка на инвентарь. */
+              static final class Holder extends Vector3 implements InventoryHolder {
+                  Inventory inv;
+
+                  Holder(int x, int y, int z) {
+                      super(x, y, z);
+                  }
+
+                  @Override
+                  public Inventory getInventory() {
+                      return inv;
+                  }
+              }
+
+              final Casino plug;
+              final Session sess;
+              private final Level lvl;
+              private final int bx;
+              private final int by;
+              private final int bz;
+              private final String menuTitle;
+              private boolean released;
+
+              private Menu(Holder holder, Casino plug, Session sess, Level lvl, String menuTitle) {
+                  super(holder, InventoryType.CHEST);
+                  holder.inv = this;
+                  this.plug = plug;
+                  this.sess = sess;
+                  this.lvl = lvl;
+                  this.bx = holder.getFloorX();
+                  this.by = holder.getFloorY();
+                  this.bz = holder.getFloorZ();
+                  this.menuTitle = menuTitle;
+              }
+
+              static Menu create(Casino plug, Session sess, String title) {
+                  Player p = sess.player;
+                  int x = p.getFloorX();
+                  int z = p.getFloorZ();
+                  int y = p.getFloorY() + 3;
+                  if (y > 250) {
+                      y = p.getFloorY() - 3;
+                  }
+                  if (y < 1) {
+                      y = 1;
+                  }
+                  return new Menu(new Holder(x, y, z), plug, sess, p.getLevel(), title);
+              }
+
+              /** Нарисовать сундук и через 10 тиков открыть окно (клиенту нужно время принять блок). */
+              void display() {
+                  final Player p = sess.player;
+                  try {
+                      Block chest = Block.get(54, 2);
+                      chest.x = bx;
+                      chest.y = by;
+                      chest.z = bz;
+                      chest.level = lvl;
+                      Fx.sendBlock(p, chest);
+                      Fx.sendChestName(p, bx, by, bz, menuTitle);
+                  } catch (Throwable ignored) {
+                      // откроем и так
+                  }
+                  plug.later(10, () -> {
+                      if (released || sess.ended || !p.isOnline()) {
+                          return;
+                      }
+                      try {
+                          sess.game.begin(); // предметы кладём ДО открытия окна (как в рабочем TopShop)
+                          p.addWindow(this);
+                      } catch (Throwable t) {
+                          plug.getLogger().warning("Не удалось открыть сундук: " + t);
+                          plug.endSession(sess);
+                      }
+                  });
+              }
+
+              /** Вернуть игроку настоящий блок на месте фейкового сундука. */
+              void restore() {
+                  if (released) {
+                      return;
+                  }
+                  released = true;
+                  try {
+                      if (sess.player.isOnline()) {
+                          Block real = lvl.getBlock(new Vector3(bx, by, bz));
+                          Fx.sendBlock(sess.player, real);
+                      }
+                  } catch (Throwable ignored) {
+                      // игрок мог выйти
+                  }
+              }
+
+              @Override
+              public void onOpen(Player who) {
+                  super.onOpen(who);
+                  plug.menuOpened(this);
+              }
+
+              @Override
+              public void onClose(Player who) {
+                  try {
+                      super.onClose(who);
+                  } catch (Throwable ignored) {
+                      // игрок мог выйти
+                  }
+                  restore();
+                  plug.menuClosed(this);
+              }
+
+              void setSlot(int slot, Item item) {
+                  try {
+                      setItem(slot, item);
+                  } catch (Throwable ignored) {
+                      // слот не критичен
+                  }
+              }
+
+              void paintAll() {
+                  for (int i = 0; i < 27; i++) {
+                      setSlot(i, Fx.filler());
+                  }
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/MinesGame.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/MinesGame.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          /**
+           * Мины: поле 21 клетка (3 ряда по 7), мин от 1 до 20. Раскладка мин решается на сервере в начале раунда.
+           * Множитель после k безопасных клеток: rtp * C(21,k) / C(21-m,k), rtp = 0.95 (настраивается).
+           * Это честный коэффициент с долей казино 5%, при любой стратегии возврат 95%.
+           */
+          final class MinesGame extends Game {
+              static final int CELLS = 21;
+              private static final int[] CASH_SLOTS = {8, 17, 26};
+
+              private final boolean[] mine = new boolean[CELLS];
+              private final boolean[] open = new boolean[CELLS];
+              private int m;
+              private int k;
+              private double rtp;
+
+              MinesGame(Casino plugin, Session s) {
+                  super(plugin, s);
+              }
+
+              /** Множитель при k открытых безопасных клетках. */
+              static double multiplier(double rtp, int mines, int safeOpened) {
+                  double v = rtp;
+                  for (int i = 0; i < safeOpened; i++) {
+                      v *= (double) (CELLS - i) / (double) (CELLS - mines - i);
+                  }
+                  return v;
+              }
+
+              private long payout(int safe) {
+                  return (long) Math.floor(s.bet * multiplier(rtp, m, safe));
+              }
+
+              @Override
+              long prepare() {
+                  rtp = plugin.getConfig().getDouble("mines-rtp", 0.95);
+                  m = Math.max(1, Math.min(CELLS - 1, s.minesCount));
+                  int placed = 0;
+                  while (placed < m) {
+                      int c = Rng.next(CELLS);
+                      if (!mine[c]) {
+                          mine[c] = true;
+                          placed++;
+                      }
+                  }
+                  return s.bet; // пока ничего не открыл - ставка возвращается
+              }
+
+              private static int slotOf(int cell) {
+                  return (cell / 7) * 9 + 1 + (cell % 7);
+              }
+
+              private static int cellOf(int slot) {
+                  int row = slot / 9;
+                  int col = slot % 9;
+                  if (row > 2 || col < 1 || col > 7) {
+                      return -1;
+                  }
+                  return row * 7 + (col - 1);
+              }
+
+              @Override
+              void begin() {
+                  paintBackground();
+                  for (int c = 0; c < CELLS; c++) {
+                      menu().setSlot(slotOf(c), Fx.pane(3, "&b&lКлетка", "&7Нажми, чтобы открыть"));
+                  }
+                  refresh();
+              }
+
+              private void refresh() {
+                  Menu mn = menu();
+                  if (mn == null || s.settled) {
+                      return;
+                  }
+                  mn.setSlot(0, Fx.item(339, 0, "&e&lСтавка: " + Fx.n(s.bet), "&7Мин на поле: " + m));
+                  mn.setSlot(9, Fx.item(339, 0, "&e&lОткрыто: " + k + " из " + (CELLS - m),
+                          k == 0 ? "&7Если закроешь окно, ставка вернётся" : "&7Закроешь окно - выигрыш заберётся сам"));
+                  mn.setSlot(18, Fx.item(339, 0, "&e&lСледующая клетка: x" + Fx.mult(multiplier(rtp, m, k + 1)),
+                          "&7Сейчас: x" + Fx.mult(k == 0 ? 1.0 : multiplier(rtp, m, k))));
+                  for (int slot : CASH_SLOTS) {
+                      if (k == 0) {
+                          mn.setSlot(slot, Fx.filler());
+                      } else {
+                          mn.setSlot(slot, Fx.item(41, 0, "&a&lЗАБРАТЬ " + Fx.n(payout(k)),
+                                  "&7Множитель: x" + Fx.mult(multiplier(rtp, m, k)), "&7Нажми, чтобы забрать выигрыш"));
+                      }
+                  }
+              }
+
+              @Override
+              void click(int slot) {
+                  if (s.settled) {
+                      return;
+                  }
+                  for (int cs : CASH_SLOTS) {
+                      if (slot == cs) {
+                          if (k > 0) {
+                              cashOut();
+                          }
+                          return;
+                      }
+                  }
+                  int c = cellOf(slot);
+                  if (c < 0 || open[c]) {
+                      return;
+                  }
+                  s.played = true;
+                  open[c] = true;
+                  if (mine[c]) {
+                      revealAll(c);
+                      Fx.sound(s.player, "RANDOM_EXPLODE", 1f);
+                      finish(0, "мины (" + m + "): подорвался на " + (k + 1) + "-й клетке");
+                      return;
+                  }
+                  k++;
+                  plugin.setOwed(s, payout(k));
+                  menu().setSlot(slotOf(c), Fx.item(388, 0, "&a&lБезопасно", "&7x" + Fx.mult(multiplier(rtp, m, k))));
+                  Fx.sound(s.player, "RANDOM_ORB", 1f);
+                  if (k >= CELLS - m) {
+                      cashOut();
+                  } else {
+                      refresh();
+                  }
+              }
+
+              private void cashOut() {
+                  revealAll(-1);
+                  long win = payout(k);
+                  if (k == 0) {
+                      s.played = false;
+                      win = s.bet;
+                  }
+                  finish(win, "мины (" + m + "): открыто " + k + ", забрал");
+              }
+
+              private void revealAll(int boomCell) {
+                  Menu mn = menu();
+                  if (mn == null) {
+                      return;
+                  }
+                  for (int c = 0; c < CELLS; c++) {
+                      if (mine[c]) {
+                          mn.setSlot(slotOf(c), Fx.item(46, 0, c == boomCell ? "&c&lМИНА! (ты тут)" : "&c&lМина"));
+                      } else if (!open[c]) {
+                          mn.setSlot(slotOf(c), Fx.pane(7, "&7Безопасно"));
+                      }
+                  }
+              }
+
+              @Override
+              void decorateResult() {
+                  Menu mn = menu();
+                  if (mn == null) {
+                      return;
+                  }
+                  mn.setSlot(8, Fx.filler());
+                  mn.setSlot(9, Fx.filler());
+                  mn.setSlot(18, Fx.filler());
+                  mn.setSlot(26, Fx.filler());
+              }
+
+              @Override
+              int infoSlot() {
+                  return 0;
+              }
+
+              @Override
+              int replaySlot() {
+                  return 9;
+              }
+
+              @Override
+              int menuSlot() {
+                  return 17;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Rng.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Rng.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import java.security.SecureRandom;
+
+          /** Весь рандом казино: только SecureRandom, решает сервер. */
+          final class Rng {
+              private static final SecureRandom R = new SecureRandom();
+
+              private Rng() {
+              }
+
+              static int next(int bound) {
+                  return R.nextInt(bound);
+              }
+
+              /** Индекс по весам. */
+              static int weighted(int[] weights) {
+                  int sum = 0;
+                  for (int w : weights) {
+                      sum += w;
+                  }
+                  int r = R.nextInt(sum);
+                  for (int i = 0; i < weights.length; i++) {
+                      r -= weights[i];
+                      if (r < 0) {
+                          return i;
+                      }
+                  }
+                  return weights.length - 1;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/RouletteGame.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/RouletteGame.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          /**
+           * Европейская рулетка (37 ячеек, один ноль). Ноль забирает все ставки, кроме ставки на 0.
+           * Любая ставка отдаёт игроку 36/37 = 97,30%.
+           */
+          final class RouletteGame extends Game {
+              /** Реальный порядок ячеек на колесе. */
+              static final int[] WHEEL = {0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10, 5, 24, 16, 33, 1,
+                      20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26};
+              static final boolean[] RED = new boolean[37];
+
+              static {
+                  for (int n : new int[]{1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}) {
+                      RED[n] = true;
+                  }
+              }
+
+              static final String[] KINDS = {
+                      "Красное (x2)", "Чёрное (x2)", "Чётное (x2)", "Нечётное (x2)", "1-18 (x2)", "19-36 (x2)",
+                      "1-я дюжина 1-12 (x3)", "2-я дюжина 13-24 (x3)", "3-я дюжина 25-36 (x3)",
+                      "1-я колонка (x3)", "2-я колонка (x3)", "3-я колонка (x3)", "Число (x36)"};
+
+              static int payMult(int kind) {
+                  return kind <= 5 ? 2 : (kind <= 11 ? 3 : 36);
+              }
+
+              static boolean wins(int kind, int num, int r) {
+                  if (kind == 12) {
+                      return r == num;
+                  }
+                  if (r == 0) {
+                      return false;
+                  }
+                  switch (kind) {
+                      case 0:
+                          return RED[r];
+                      case 1:
+                          return !RED[r];
+                      case 2:
+                          return r % 2 == 0;
+                      case 3:
+                          return r % 2 == 1;
+                      case 4:
+                          return r <= 18;
+                      case 5:
+                          return r >= 19;
+                      case 6:
+                          return r <= 12;
+                      case 7:
+                          return r >= 13 && r <= 24;
+                      case 8:
+                          return r >= 25;
+                      case 9:
+                          return r % 3 == 1;
+                      case 10:
+                          return r % 3 == 2;
+                      case 11:
+                          return r % 3 == 0;
+                      default:
+                          return false;
+                  }
+              }
+
+              private int result;
+              private long win;
+              private int center;
+              private int total;
+              private int step;
+              private int wait;
+              private int phase;
+
+              RouletteGame(Casino plugin, Session s) {
+                  super(plugin, s);
+              }
+
+              @Override
+              long prepare() {
+                  result = Rng.next(37);
+                  win = wins(s.rouletteKind, s.rouletteNumber, result) ? s.bet * payMult(s.rouletteKind) : 0;
+                  s.played = true;
+                  return win;
+              }
+
+              @Override
+              void begin() {
+                  paintBackground();
+                  Menu m = menu();
+                  String what = KINDS[s.rouletteKind] + (s.rouletteKind == 12 ? ": " + s.rouletteNumber : "");
+                  m.setSlot(0, Fx.item(339, 0, "&e&lСтавка: " + Fx.n(s.bet), "&7" + what));
+                  m.setSlot(4, Fx.item(262, 0, "&e&lv", "&7Сюда выпадет число"));
+                  m.setSlot(22, Fx.item(262, 0, "&e&l^", "&7Сюда выпадет число"));
+                  int idxWin = 0;
+                  for (int i = 0; i < 37; i++) {
+                      if (WHEEL[i] == result) {
+                          idxWin = i;
+                      }
+                  }
+                  center = Rng.next(37);
+                  total = 37 + ((idxWin - center) % 37 + 37) % 37;
+                  step = 0;
+                  wait = 8;
+                  phase = 1;
+                  render();
+              }
+
+              private void render() {
+                  Menu m = menu();
+                  if (m == null) {
+                      return;
+                  }
+                  for (int d = -4; d <= 4; d++) {
+                      int num = WHEEL[((center + d) % 37 + 37) % 37];
+                      int color = num == 0 ? 5 : (RED[num] ? 14 : 15);
+                      String name = (num == 0 ? "&a&l" : (RED[num] ? "&c&l" : "&7&l")) + num;
+                      m.setSlot(13 + d, Fx.wool(color, name));
+                  }
+              }
+
+              @Override
+              void tick() {
+                  if (phase != 1) {
+                      return;
+                  }
+                  if (--wait > 0) {
+                      return;
+                  }
+                  step++;
+                  center = (center + 1) % 37;
+                  render();
+                  Fx.sound(s.player, "RANDOM_CLICK", 1.0f);
+                  int rem = total - step;
+                  if (rem <= 0) {
+                      phase = 2;
+                      String col = result == 0 ? "зелёное" : (RED[result] ? "красное" : "чёрное");
+                      finish(win, "рулетка: выпало " + result + " (" + col + "), ставка " + KINDS[s.rouletteKind]
+                              + (s.rouletteKind == 12 ? " " + s.rouletteNumber : ""));
+                  } else {
+                      wait = rem > 30 ? 1 : (rem > 16 ? 2 : (rem > 8 ? 3 : (rem > 3 ? 5 : 8)));
+                  }
+              }
+
+              @Override
+              int infoSlot() {
+                  return 22;
+              }
+
+              @Override
+              int replaySlot() {
+                  return 20;
+              }
+
+              @Override
+              int menuSlot() {
+                  return 24;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Session.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Session.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.Player;
+
+          /** Одна игровая сессия игрока (от нажатия "Сделать ставку" до закрытия сундука). */
+          final class Session {
+              final Player player;
+              final String key;
+              final GameType type;
+              final boolean free;
+              long bet;
+              int minesCount = 3;
+              int rouletteKind;
+              int rouletteNumber;
+
+              Menu menu;
+              Game game;
+
+              /** Сколько монет причитается игроку, если всё оборвётся прямо сейчас. */
+              long owed;
+              boolean played;
+              boolean settled;
+              boolean ended;
+              boolean menuOpened;
+              boolean resultShown;
+              long created;
+              long lastClick;
+
+              Session(Player player, String key, GameType type, long bet, boolean free) {
+                  this.player = player;
+                  this.key = key;
+                  this.type = type;
+                  this.bet = bet;
+                  this.free = free;
+              }
+
+              void resetRound() {
+                  played = false;
+                  settled = false;
+                  resultShown = false;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/SlotsGame.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/SlotsGame.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.item.Item;
+
+          /**
+           * Слоты: 3 барабана по 20 позиций, платит средняя линия.
+           * Веса: вишня 8, лимон 5, колокол 4, алмаз 2, семёрка 1 (из 20).
+           * Возврат игроку 93,0%. Считается точно: см. multPm.
+           */
+          final class SlotsGame extends Game {
+              static final int[] WEIGHTS = {8, 5, 4, 2, 1};
+              static final String[] NAMES = {"&c&lВишня", "&e&lЛимон", "&6&lКолокол", "&b&lАлмаз", "&d&lСемёрка"};
+              static final String[] PLAIN = {"Вишня", "Лимон", "Колокол", "Алмаз", "Семёрка"};
+              static final int[] IDS = {260, 371, 266, 264, 399};
+              /** Выплата за три одинаковых, в тысячных долях ставки (x3, x10, x25, x80, x400). */
+              static final long[] TRIPLE_PM = {3000, 10000, 25000, 80000, 400000};
+
+              /** Множитель в тысячных долях ставки для комбинации средней линии. */
+              static long multPm(int a, int b, int c) {
+                  if (a == b && b == c) {
+                      return TRIPLE_PM[a];
+                  }
+                  int cherries = (a == 0 ? 1 : 0) + (b == 0 ? 1 : 0) + (c == 0 ? 1 : 0);
+                  if (cherries == 2) {
+                      return 500;
+                  }
+                  if (cherries == 1) {
+                      return 250;
+                  }
+                  return 0;
+              }
+
+              private final int[] stop = {14, 20, 26};
+              private final int[][] grid = new int[3][3];
+              private final int[][] feed = new int[3][];
+              private final int[] res = new int[3];
+              private int frame;
+              private int wait;
+              private int phase;
+              private long win;
+
+              SlotsGame(Casino plugin, Session s) {
+                  super(plugin, s);
+              }
+
+              @Override
+              long prepare() {
+                  for (int r = 0; r < 3; r++) {
+                      res[r] = Rng.weighted(WEIGHTS);
+                  }
+                  win = s.bet * multPm(res[0], res[1], res[2]) / 1000L;
+                  s.played = true;
+                  return win;
+              }
+
+              @Override
+              void begin() {
+                  paintBackground();
+                  Menu m = menu();
+                  for (int r = 0; r < 3; r++) {
+                      feed[r] = new int[stop[r]];
+                      for (int i = 0; i < stop[r]; i++) {
+                          feed[r][i] = Rng.weighted(WEIGHTS);
+                      }
+                      // после последнего сдвига средняя клетка барабана = заранее выпавший символ
+                      feed[r][stop[r] - 2] = res[r];
+                      for (int row = 0; row < 3; row++) {
+                          grid[r][row] = Rng.weighted(WEIGHTS);
+                      }
+                  }
+                  m.setSlot(11, Fx.item(262, 0, "&e&l>>", "&7Платит средняя линия"));
+                  m.setSlot(15, Fx.item(262, 0, "&e&l<<", "&7Платит средняя линия"));
+                  m.setSlot(1, Fx.item(339, 0, "&e&lСтавка: " + Fx.n(s.bet), "&7Платит средняя линия"));
+                  render();
+                  frame = 0;
+                  wait = 10;
+                  phase = 1;
+              }
+
+              private Item sym(int i) {
+                  return Fx.item(IDS[i], 0, NAMES[i]);
+              }
+
+              private void render() {
+                  Menu m = menu();
+                  if (m == null) {
+                      return;
+                  }
+                  for (int r = 0; r < 3; r++) {
+                      for (int row = 0; row < 3; row++) {
+                          m.setSlot(row * 9 + 3 + r, sym(grid[r][row]));
+                      }
+                  }
+              }
+
+              @Override
+              void tick() {
+                  if (phase != 1) {
+                      return;
+                  }
+                  if (--wait > 0) {
+                      return;
+                  }
+                  frame++;
+                  for (int r = 0; r < 3; r++) {
+                      if (frame <= stop[r]) {
+                          grid[r][2] = grid[r][1];
+                          grid[r][1] = grid[r][0];
+                          grid[r][0] = feed[r][frame - 1];
+                      }
+                  }
+                  render();
+                  Fx.sound(s.player, "RANDOM_CLICK", 1.2f);
+                  if (frame >= stop[2]) {
+                      phase = 2;
+                      finish(win, "слоты: " + PLAIN[res[0]] + " / " + PLAIN[res[1]] + " / " + PLAIN[res[2]]);
+                  } else {
+                      wait = frame <= 20 ? 2 : (frame <= 24 ? 3 : 4);
+                  }
+              }
+
+              @Override
+              int infoSlot() {
+                  return 1;
+              }
+
+              @Override
+              int replaySlot() {
+                  return 9;
+              }
+
+              @Override
+              int menuSlot() {
+                  return 17;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/Store.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/Store.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+
+          import java.io.File;
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.lang.reflect.Type;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.AtomicMoveNotSupportedException;
+          import java.nio.file.Files;
+          import java.nio.file.StandardCopyOption;
+          import java.nio.file.StandardOpenOption;
+          import java.time.LocalDate;
+          import java.time.LocalDateTime;
+          import java.time.format.DateTimeFormatter;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.TimeUnit;
+
+          /**
+           * Хранилище на диске:
+           *  - pending.json: сколько монет причитается игроку по незавершённым играм (выплата после краша/выхода);
+           *  - data.json: статистика казино, топ выигрышей, время последнего бесплатного спина;
+           *  - logs/casino-ГГГГ-ММ-ДД.log: лог каждой игры (пишется в отдельном потоке).
+           */
+          final class Store {
+              static final class GameStat {
+                  long games;
+                  long wagered;
+                  long paid;
+              }
+
+              static final class Win {
+                  String player;
+                  String game;
+                  long bet;
+                  long win;
+                  long time;
+              }
+
+              static final class Data {
+                  Map<String, GameStat> games = new LinkedHashMap<>();
+                  List<Win> top = new ArrayList<>();
+                  Map<String, Long> freeSpin = new HashMap<>();
+              }
+
+              private static final Type PENDING_TYPE = new TypeToken<Map<String, Long>>() { }.getType();
+              private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+              private final Casino plugin;
+              private final File dataFile;
+              private final File pendingFile;
+              private final File logDir;
+              private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+              private final Map<String, Long> pending = new HashMap<>();
+              private Data data = new Data();
+              private boolean dirty;
+              private final ExecutorService logExec = Executors.newSingleThreadExecutor(r -> {
+                  Thread t = new Thread(r, "Casino-log");
+                  t.setDaemon(true);
+                  return t;
+              });
+
+              Store(Casino plugin, int keepDays) {
+                  this.plugin = plugin;
+                  this.dataFile = new File(plugin.getDataFolder(), "data.json");
+                  this.pendingFile = new File(plugin.getDataFolder(), "pending.json");
+                  this.logDir = new File(plugin.getDataFolder(), "logs");
+                  plugin.getDataFolder().mkdirs();
+                  logDir.mkdirs();
+                  load();
+                  cleanupLogs(Math.max(1, keepDays));
+              }
+
+              // ---------- pending ----------
+
+              synchronized void setPending(String key, long amount) {
+                  pending.put(key, amount);
+                  writeFile(pendingFile, pending, PENDING_TYPE);
+              }
+
+              synchronized void clearPending(String key) {
+                  if (pending.remove(key) != null) {
+                      writeFile(pendingFile, pending, PENDING_TYPE);
+                  }
+              }
+
+              synchronized long getPending(String key) {
+                  Long v = pending.get(key);
+                  return v == null ? 0 : v;
+              }
+
+              synchronized Map<String, Long> pendingCopy() {
+                  return new HashMap<>(pending);
+              }
+
+              // ---------- бесплатный спин ----------
+
+              synchronized long lastFree(String key) {
+                  Long v = data.freeSpin.get(key);
+                  return v == null ? 0 : v;
+              }
+
+              synchronized void markFree(String key, long time) {
+                  data.freeSpin.put(key, time);
+                  writeFile(dataFile, data, Data.class);
+                  dirty = false;
+              }
+
+              // ---------- статистика ----------
+
+              synchronized void record(String gameKey, long bet, long paid) {
+                  GameStat g = data.games.computeIfAbsent(gameKey, k -> new GameStat());
+                  g.games++;
+                  g.wagered += bet;
+                  g.paid += paid;
+                  dirty = true;
+              }
+
+              synchronized void addTop(String player, String game, long bet, long win) {
+                  if (win <= 0) {
+                      return;
+                  }
+                  Win w = new Win();
+                  w.player = player;
+                  w.game = game;
+                  w.bet = bet;
+                  w.win = win;
+                  w.time = System.currentTimeMillis();
+                  data.top.add(w);
+                  data.top.sort((a, b) -> Long.compare(b.win, a.win));
+                  while (data.top.size() > 10) {
+                      data.top.remove(data.top.size() - 1);
+                  }
+                  dirty = true;
+              }
+
+              synchronized Map<String, GameStat> statsCopy() {
+                  Map<String, GameStat> copy = new LinkedHashMap<>();
+                  for (Map.Entry<String, GameStat> e : data.games.entrySet()) {
+                      GameStat g = new GameStat();
+                      g.games = e.getValue().games;
+                      g.wagered = e.getValue().wagered;
+                      g.paid = e.getValue().paid;
+                      copy.put(e.getKey(), g);
+                  }
+                  return copy;
+              }
+
+              synchronized List<Win> topCopy() {
+                  return new ArrayList<>(data.top);
+              }
+
+              synchronized void saveStats() {
+                  if (dirty) {
+                      writeFile(dataFile, data, Data.class);
+                      dirty = false;
+                  }
+              }
+
+              // ---------- лог ----------
+
+              void log(String nick, String game, long bet, long win, String detail) {
+                  final String line = "[" + TIME.format(LocalDateTime.now()) + "] " + nick + " | " + game
+                          + " | ставка " + bet + " | выплата " + win + " | " + detail + System.lineSeparator();
+                  final File f = new File(logDir, "casino-" + LocalDate.now() + ".log");
+                  try {
+                      logExec.execute(() -> {
+                          try {
+                              Files.write(f.toPath(), line.getBytes(StandardCharsets.UTF_8),
+                                      StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                          } catch (IOException ignored) {
+                              // лог не критичен
+                          }
+                      });
+                  } catch (RuntimeException ignored) {
+                      // пул уже закрыт
+                  }
+              }
+
+              void shutdown() {
+                  saveStats();
+                  logExec.shutdown();
+                  try {
+                      logExec.awaitTermination(3, TimeUnit.SECONDS);
+                  } catch (InterruptedException ignored) {
+                      Thread.currentThread().interrupt();
+                  }
+              }
+
+              // ---------- внутреннее ----------
+
+              private void cleanupLogs(int keepDays) {
+                  File[] files = logDir.listFiles();
+                  if (files == null) {
+                      return;
+                  }
+                  LocalDate limit = LocalDate.now().minusDays(keepDays);
+                  for (File f : files) {
+                      String n = f.getName();
+                      if (!n.startsWith("casino-") || !n.endsWith(".log")) {
+                          continue;
+                      }
+                      try {
+                          LocalDate d = LocalDate.parse(n.substring(7, n.length() - 4));
+                          if (d.isBefore(limit)) {
+                              f.delete();
+                          }
+                      } catch (RuntimeException ignored) {
+                          // чужой файл - не трогаем
+                      }
+                  }
+              }
+
+              private void load() {
+                  if (pendingFile.exists()) {
+                      try (Reader r = Files.newBufferedReader(pendingFile.toPath(), StandardCharsets.UTF_8)) {
+                          Map<String, Long> m = gson.fromJson(r, PENDING_TYPE);
+                          if (m != null) {
+                              pending.putAll(m);
+                          }
+                      } catch (Exception e) {
+                          plugin.getLogger().error("pending.json повреждён: " + e.getMessage());
+                          backup(pendingFile);
+                      }
+                  }
+                  if (dataFile.exists()) {
+                      try (Reader r = Files.newBufferedReader(dataFile.toPath(), StandardCharsets.UTF_8)) {
+                          Data d = gson.fromJson(r, Data.class);
+                          if (d != null) {
+                              if (d.games == null) {
+                                  d.games = new LinkedHashMap<>();
+                              }
+                              if (d.top == null) {
+                                  d.top = new ArrayList<>();
+                              }
+                              if (d.freeSpin == null) {
+                                  d.freeSpin = new HashMap<>();
+                              }
+                              data = d;
+                          }
+                      } catch (Exception e) {
+                          plugin.getLogger().error("data.json повреждён: " + e.getMessage());
+                          backup(dataFile);
+                      }
+                  }
+              }
+
+              private void backup(File f) {
+                  try {
+                      Files.copy(f.toPath(), new File(f.getParentFile(), f.getName() + ".broken-" + System.currentTimeMillis()).toPath());
+                  } catch (IOException ignored) {
+                      // нечего делать
+                  }
+              }
+
+              private void writeFile(File target, Object obj, Type type) {
+                  File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
+                  try (Writer w = Files.newBufferedWriter(tmp.toPath(), StandardCharsets.UTF_8)) {
+                      gson.toJson(obj, type, w);
+                  } catch (IOException e) {
+                      plugin.getLogger().error("Не удалось сохранить " + target.getName() + ": " + e.getMessage());
+                      return;
+                  }
+                  try {
+                      Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                  } catch (AtomicMoveNotSupportedException e) {
+                      try {
+                          Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                      } catch (IOException e2) {
+                          plugin.getLogger().error("Не удалось сохранить " + target.getName() + ": " + e2.getMessage());
+                      }
+                  } catch (IOException e) {
+                      plugin.getLogger().error("Не удалось сохранить " + target.getName() + ": " + e.getMessage());
+                  }
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/java/ru/eclips/casino/WheelGame.java')"
+          cat > 'Casino/src/main/java/ru/eclips/casino/WheelGame.java' << 'CASINO_EOF'
+          package ru.eclips.casino;
+
+          import cn.nukkit.item.Item;
+
+          import java.util.List;
+
+          /**
+           * Колесо фортуны: 20 секторов по кольцу из ячеек сундука.
+           * Платное: x0 (7 секторов), x0.5 (5), x1 (4), x2 (2), x3 (1), x5 (1) -> возврат 18.5/20 = 92,5%.
+           * Бесплатный спин (раз в сутки): призы из config.yml (по умолчанию 1000-5000).
+           */
+          final class WheelGame extends Game {
+              /** Ячейки кольца по часовой стрелке: верх слева направо, правый бок, низ справа налево, левый бок. */
+              static final int[] RING = {0, 1, 2, 3, 4, 5, 6, 7, 8, 17, 26, 25, 24, 23, 22, 21, 20, 19, 18, 9};
+              /** Множители секторов в десятых долях (5 = x0.5). Порядок разложен так, что одинаковые не стоят рядом. */
+              static final int[] SECT = {0, 10, 0, 5, 0, 20, 0, 10, 5, 30, 0, 5, 10, 0, 50, 5, 0, 10, 20, 5};
+              static final int[] DEFAULT_PRIZES = {1000, 2000, 1000, 1500, 1000, 3000, 1000, 2000, 1500, 5000,
+                      1000, 1500, 2500, 1000, 4000, 1500, 1000, 2500, 2000, 1000};
+
+              private final int[] vals = new int[20];
+              private int winIdx;
+              private long win;
+              private int pos;
+              private int total;
+              private int step;
+              private int wait;
+              private int phase;
+              private int blink;
+
+              WheelGame(Casino plugin, Session s) {
+                  super(plugin, s);
+              }
+
+              @Override
+              long prepare() {
+                  if (s.free) {
+                      int[] prizes = freePrizes(plugin);
+                      System.arraycopy(prizes, 0, vals, 0, 20);
+                  } else {
+                      System.arraycopy(SECT, 0, vals, 0, 20);
+                  }
+                  winIdx = Rng.next(20);
+                  win = s.free ? vals[winIdx] : s.bet * vals[winIdx] / 10L;
+                  s.played = true;
+                  return win;
+              }
+
+              static int[] freePrizes(Casino plugin) {
+                  int[] out = new int[20];
+                  try {
+                      List<Integer> list = plugin.getConfig().getIntegerList("free-spin-prizes");
+                      if (list != null && list.size() == 20) {
+                          for (int i = 0; i < 20; i++) {
+                              out[i] = Math.max(0, list.get(i));
+                          }
+                          return out;
+                      }
+                  } catch (Throwable ignored) {
+                      // берём значения по умолчанию
+                  }
+                  System.arraycopy(DEFAULT_PRIZES, 0, out, 0, 20);
+                  return out;
+              }
+
+              private int color(int i) {
+                  int v = vals[i];
+                  if (!s.free) {
+                      switch (v) {
+                          case 0:
+                              return 14;
+                          case 5:
+                              return 1;
+                          case 10:
+                              return 4;
+                          case 20:
+                              return 5;
+                          case 30:
+                              return 3;
+                          default:
+                              return 10;
+                      }
+                  }
+                  if (v <= 1000) {
+                      return 4;
+                  }
+                  if (v <= 1500) {
+                      return 1;
+                  }
+                  if (v <= 2000) {
+                      return 5;
+                  }
+                  if (v <= 2500) {
+                      return 9;
+                  }
+                  if (v <= 3000) {
+                      return 3;
+                  }
+                  if (v <= 4000) {
+                      return 10;
+                  }
+                  return 2;
+              }
+
+              private String label(int i) {
+                  int v = vals[i];
+                  if (s.free) {
+                      return "&l+" + Fx.n(v);
+                  }
+                  return "&lx" + (v % 10 == 0 ? String.valueOf(v / 10) : (v / 10) + "." + (v % 10));
+              }
+
+              private void cell(int i, boolean hot) {
+                  Menu m = menu();
+                  if (m == null) {
+                      return;
+                  }
+                  Item it = hot ? Fx.wool(color(i), "&e>> " + label(i) + " &e<<") : Fx.pane(color(i), label(i));
+                  m.setSlot(RING[i], it);
+              }
+
+              @Override
+              void begin() {
+                  paintBackground();
+                  Menu m = menu();
+                  if (s.free) {
+                      m.setSlot(13, Fx.item(339, 0, "&e&lБесплатный спин", "&7Приз: 1000-5000 монет"));
+                  } else {
+                      m.setSlot(13, Fx.item(339, 0, "&e&lСтавка: " + Fx.n(s.bet), "&7Колесо фортуны"));
+                  }
+                  pos = Rng.next(20);
+                  for (int i = 0; i < 20; i++) {
+                      cell(i, i == pos);
+                  }
+                  total = 40 + ((winIdx - pos) % 20 + 20) % 20;
+                  step = 0;
+                  wait = 10;
+                  blink = 0;
+                  phase = 1;
+              }
+
+              @Override
+              void tick() {
+                  if (phase == 1) {
+                      if (--wait > 0) {
+                          return;
+                      }
+                      step++;
+                      int old = pos;
+                      pos = (pos + 1) % 20;
+                      cell(old, false);
+                      cell(pos, true);
+                      Fx.sound(s.player, "RANDOM_CLICK", 1.0f);
+                      int rem = total - step;
+                      if (rem <= 0) {
+                          phase = 2;
+                          wait = 4;
+                      } else {
+                          wait = rem > 24 ? 1 : (rem > 14 ? 2 : (rem > 7 ? 3 : (rem > 3 ? 5 : 8)));
+                      }
+                  } else if (phase == 2) {
+                      if (--wait > 0) {
+                          return;
+                      }
+                      blink++;
+                      cell(winIdx, blink % 2 == 1 ? false : true);
+                      wait = 4;
+                      if (blink >= 7) {
+                          cell(winIdx, true);
+                          phase = 3;
+                          finish(win, s.free ? "бесплатный спин: приз " + win
+                                  : "колесо: сектор " + label(winIdx).replace("&l", ""));
+                      }
+                  }
+              }
+
+              @Override
+              void decorateResult() {
+                  // центр кольца свободен под итоговые кнопки
+                  Menu m = menu();
+                  if (m != null) {
+                      m.setSlot(13, Fx.filler());
+                  }
+              }
+
+              @Override
+              int infoSlot() {
+                  return 13;
+              }
+
+              @Override
+              int replaySlot() {
+                  return 11;
+              }
+
+              @Override
+              int menuSlot() {
+                  return 15;
+              }
+          }
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/resources/config.yml')"
+          cat > 'Casino/src/main/resources/config.yml' << 'CASINO_EOF'
+          # Casino config. Цвета: & + код (&a, &c, &e ...)
+          # После обновления плагина удали старый config.yml, чтобы появились новые ключи.
+          # Валюта: монеты TpCoins (плагин TpCoins обязателен).
+
+          # Префикс сообщений казино в чате
+          prefix: "&6[Казино]&r "
+
+          # Минимальная и максимальная ставка (монет)
+          min-bet: 500
+          max-bet: 50000
+
+          # Пауза между играми одного игрока, секунд
+          cooldown-seconds: 3
+
+          # Выигрыш от этого множителя объявляется всему серверу в чате (0 = не объявлять)
+          announce-multiplier: 50
+
+          # Миры, где казино запрещено (имя или папка мира). Пример: ["world_nether", "5"]
+          disabled-worlds: []
+
+          # Мины: возврат игроку (0.95 = 95%, доля казино 5%)
+          mines-rtp: 0.95
+
+          # 3 сундука: множитель выигрыша. Шанс 1/3, значит 2.85 даёт возврат 95%
+          chests-multiplier: 2.85
+
+          # Бесплатный спин: раз в сколько часов можно
+          free-spin-hours: 24
+          # Призы бесплатного спина: ровно 20 секторов колеса (повтор значения = выше шанс).
+          # По умолчанию среднее 1850 монет, диапазон 1000-5000.
+          free-spin-prizes: [1000, 2000, 1000, 1500, 1000, 3000, 1000, 2000, 1500, 5000, 1000, 1500, 2500, 1000, 4000, 1500, 1000, 2500, 2000, 1000]
+
+          # Сколько дней хранить логи игр (plugins/Casino/logs/)
+          log-keep-days: 30
+          CASINO_EOF
+          mkdir -p "$(dirname 'Casino/src/main/resources/plugin.yml')"
+          cat > 'Casino/src/main/resources/plugin.yml' << 'CASINO_EOF'
+          name: Casino
+          main: ru.eclips.casino.Casino
+          version: "1.0.1"
+          api: ["1.0.0"]
+          author: Eclips
+          depend: [TpCoins]
+          description: Casino - slots, mines, roulette, 3 chests, wheel (coins from TpCoins)
+
+          commands:
+            casino:
+              description: Открыть казино
+              usage: "/casino"
+              permission: casino.use
+            spin:
+              description: Бесплатный спин колеса или быстрая ставка
+              usage: "/spin [ставка]"
+              permission: casino.use
+
+          permissions:
+            casino.use:
+              description: Play in the casino (/casino, /spin)
+              default: "true"
+            casino.admin:
+              description: Casino admin commands (/casino stats, top, reload)
+              default: op
+          CASINO_EOF
+      - name: Build
+        run: mvn -B clean package
+        working-directory: Casino
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Casino-jar
+          path: Casino/target/Casino-1.0.1.jar
